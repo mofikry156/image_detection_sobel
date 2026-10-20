@@ -507,7 +507,7 @@ wrong. This section shows how to set it up so the ROM really contains the table.
 | `rom.v` | the ROM wrapper made by the MegaWizard |
 | `altera_mf.v` | Altera's simulation model of `altsyncram` (about 31,000 lines, from `<quartus>/eda/sim_lib/`) |
 | `lane_g_root.mif` | the table that fills the ROM |
-| `sim_lane.vhd` | the testbench (VHDL) |
+| `sim_lane.vhd` | the testbench (VHDL), protocol described in section 5 |
 | `street_A_stimuli.txt`, `street_A_expected.txt` | input image and correct answer, made by `lane_testbench` |
 
 Do **not** add `rom_bb.v` to the simulation. It is an empty black box for Quartus.
@@ -604,3 +604,160 @@ Open `street_A_response.txt` and look at the lines after the first two rows
 | `00 00 00` in every valid pixel | The ROM is empty: the `.mif` was not found | Put `lane_g_root.mif` in the working directory and restart the simulation |
 | Values are real but a few differ by 1 | The `.mif` was built with a different rounding | Rebuild it with the script in 3.8.1 |
 | Values are real but shifted by one or more pixels | Pipeline delay is not 7 clocks | Check the delay of `lane_sync` against section 3.10 |
+
+
+## 5. Writing your own testbench (how pixels enter and leave the design)
+
+This section describes the interface of the top module `lane` and the exact
+protocol that `sim_lane.vhd` uses. If you follow the same protocol, any new
+testbench will work with the design.
+
+### 5.1 How the design receives pixels from the upper layer
+
+The design has **no memory interface and no handshake**. The upper layer (the
+video source on the board, or the testbench in simulation) pushes the image in
+as a **video stream**: one pixel per clock, row by row, left to right, top to
+bottom. The design cannot ask the source to wait, so the source must deliver
+every pixel on time.
+
+Three control signals tell the design what is on the pixel wires:
+
+| Signal | Meaning |
+|---|---|
+| `de_in` (data enable) | 1 = `r_in`, `g_in`, `b_in` hold a **real pixel** right now. 0 = blanking, ignore the colour wires. This is the "a real pixel is here" flag that the line memory and the Sobel kernel use as `i_write_en` (delayed to match the luminance module, see 3.2). |
+| `hs_in` (horizontal sync) | 1 during the blanking time **before** the pixels of every row. |
+| `vs_in` (vertical sync) | 1 during the **first row** of every frame. It marks the start of a new image. |
+
+### 5.2 Ports of `lane`
+
+#### Inputs
+
+| Pin | Size | What the testbench does with it |
+|---|---|---|
+| `clk` | 1 bit | Clock, period 10 ns (100 MHz). The design samples all inputs on the **rising** edge. |
+| `reset_n` | 1 bit | Reset, active low (see 5.3). |
+| `enable_in` | 3 bits | Held at `"111"` for the whole run. |
+| `vs_in` | 1 bit | Vertical sync (see 5.1). |
+| `hs_in` | 1 bit | Horizontal sync (see 5.1). |
+| `de_in` | 1 bit | Data enable (see 5.1). |
+| `r_in`, `g_in`, `b_in` | 8 bits each | The pixel colour. Together they are `i_rgb` of the luminance module (`{r, g, b}`, 24 bits). |
+
+#### Outputs
+
+| Pin | Size | What it does |
+|---|---|---|
+| `vs_out`, `hs_out`, `de_out` | 1 bit each | The same three signals as the inputs, delayed by **7 clocks** (see 3.10), so they stay lined up with the output pixel. |
+| `r_out`, `g_out`, `b_out` | 8 bits each | The edge pixel. All three are equal (gray, see 3.9). Only valid when `de_out = 1`. |
+| `clk_o`, `led` | 1 bit, 3 bits | Connected in the testbench but **not checked**. |
+
+### 5.3 Reset
+
+- `reset_n` is **0 from time 0 until 50 ns**, then goes to 1. With a 10 ns
+  clock this is **5 rising clock edges** (at 5, 15, 25, 35 and 45 ns).
+- During reset all inputs are 0 (`vs_in`, `hs_in`, `de_in` and the colour wires),
+  so no pixel is sent.
+- After reset is released the testbench waits until **100 ns** (another 5
+  clocks) before the first row starts. So the first pixel only arrives when the
+  design has been out of reset for some time.
+- Reset is applied **once, at the start**, and never again during a frame.
+  Pixels that arrive during reset are lost, and the line memories are not
+  cleared (see "Reset" in the Line Memory section and 3.11).
+
+### 5.4 Timing of one frame
+
+Every row has a blanking part and an active part:
+
+```
+             |<-- x_blank = 100 clocks -->|<----- x_size = 1280 clocks ----->|
+hs_in    ____/``````````````````````````\_____________________________________/``` (next row)
+de_in    ____________________________________/```````````````````````````````\____
+r/g/b    0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 p0  p1  p2  ...  p1278  p1279  0 0 0
+```
+
+| Part | Length | `hs_in` | `de_in` | `r_in`, `g_in`, `b_in` |
+|---|---|---|---|---|
+| Blanking | 100 clocks | 1 | 0 | 0 |
+| Active pixels | 1280 clocks | 0 | 1 | one pixel per clock |
+
+Other rules:
+
+- `vs_in` is 1 during the **whole first row** (blanking and active part) and 0
+  for all other rows.
+- One row takes 100 + 1280 = **1380 clocks**. One frame of 720 rows takes
+  720 × 1380 = **993,600 clocks**, which is about **9.94 ms** at 10 ns.
+- The testbench changes its inputs on the **falling** clock edge. Every pixel
+  stays on the wires for exactly one clock and is taken by the design on the
+  next rising edge. This avoids a race between the clock and the data.
+- The 1280 active pixels of a row follow each other **without gaps**
+  (`de_in` stays 1 for the whole row). Gaps inside a row are not tested.
+- After the last row, `de_in` and `hs_in` stay 0 and the testbench runs for
+  **1000 more clocks** (`trail`), so that the last pixels (7 clocks of
+  pipeline delay) can leave the design before the simulation stops.
+
+### 5.5 The testbench constants
+
+These constants are at the top of `sim_lane.vhd`:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `stimuli_filename` | `street_0_stimuli.txt` | Input image. |
+| `expected_filename` | `street_0_expected.txt` | Correct answer from the C model. |
+| `response_filename` | `street_0_response.txt` | Written by the testbench. |
+| `x_size` | 1280 | Pixels per row. |
+| `y_size` | 720 | Rows per frame. |
+| `x_blank` | 100 | Clocks of horizontal blanking before every row. |
+| `trail` | 1000 | Clocks to run after the last row. |
+
+If you use a different image size, change `x_size` and `y_size` **and** the
+`depth` parameter of the line memory (it must equal the image width, see the
+Line Memory section).
+
+### 5.6 The text file format
+
+The stimuli, expected and response files all use the same format:
+
+```
+# comment line (skipped by the testbench)
+FF A0 12
+...
+```
+
+- The first line is a comment.
+- Then **one line per pixel**: red, green and blue as 2-digit hex numbers,
+  separated by spaces.
+- The order is row by row, left to right, top to bottom, so a 1280 × 720 image
+  has 921,600 pixel lines.
+
+### 5.7 How the testbench reads the output
+
+- It waits for the **first `hs_out = 1`**, then looks at the output on every
+  falling clock edge.
+- Whenever `de_out = 1`, that is one output pixel. The testbench counts the
+  pixels itself (`x_pos` from 0 to 1279, then `y_pos` goes up by one). It does
+  **not** use `vs_out` or `hs_out` after the start, so the design must produce
+  exactly 1280 `de_out` pixels per row, in order.
+- For `x_pos < 2` or `y_pos < 2` (the invalid border, see 3.11), the testbench
+  writes white (`FF FF FF`) to the response file and does **not** compare.
+  The expected file still has a line for these pixels, which is read and
+  ignored.
+- For all other pixels, `r_out`, `g_out`, `b_out` are compared with the
+  expected line. Every difference increases `mismatch` and prints
+  `MISMATCH in simulation at position x=... y=...`.
+- The testbench ends on purpose with `severity failure` (see 4.6), which
+  prints either `EVERYTHING OK` or the number of mismatches.
+
+### 5.8 Checklist for a new testbench
+
+1. Instantiate `lane` and connect all ports (`clk_o` and `led` can be left
+   unused). Use a clock with a 10 ns period.
+2. Set `enable_in` to `"111"` and all other inputs to 0.
+3. Hold `reset_n` at 0 for at least 5 clocks, then release it.
+4. Wait a few clocks after reset (the supplied testbench waits until 100 ns).
+5. For every row: `hs_in = 1` for 100 clocks with `de_in = 0`; then `hs_in = 0`,
+   `de_in = 1`, and one pixel per clock for 1280 clocks; then `de_in = 0` and
+   the colour wires back to 0. Set `vs_in = 1` in the first row only.
+6. Change the inputs on the falling clock edge.
+7. After the last row, wait at least 7 clocks (the pipeline delay) before you
+   stop. The supplied testbench waits 1000.
+8. Capture `r_out`, `g_out`, `b_out` on every clock where `de_out = 1`, and
+   ignore the first two columns and the first two rows.
