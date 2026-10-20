@@ -1,0 +1,14 @@
+# Ignore everything
+*
+
+# Allow directories
+!*/
+
+# Allow these file types
+!*.sv
+!*.vhdl
+!*.md
+!*.mif
+
+# Keep the ignore rules themselves
+!.gitignore
